@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>領収書の出し忘れチェック（1画面デモ）</title>
+<style>
+:root{--bg:#f7f6f2;--card:#fff;--ink:#222;--mute:#666;--line:#d9d6cc;--acc:#2f6f5e;--ng:#b3261e;--warn:#9a6700}
+@media(prefers-color-scheme:dark){:root{--bg:#1b1c1b;--card:#242625;--ink:#eee;--mute:#aaa;--line:#3b3e3c;--acc:#6fc3a9;--ng:#ff8a80;--warn:#e3b341}}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.6 system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:16px}
+h1{font-size:1.35rem;margin:.2em 0}h2{font-size:1.05rem;margin:1.2em 0 .4em}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:12px 0}
+.note{color:var(--mute);font-size:.88rem}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media(max-width:640px){.cols{grid-template-columns:1fr}}
+textarea{width:100%;box-sizing:border-box;min-height:150px;padding:8px;font:inherit;font-size:.9rem;border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--ink)}
+input[type=number]{width:4em;padding:4px;font:inherit}
+button{font:inherit;padding:9px 14px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink);cursor:pointer;margin:4px 6px 4px 0}
+button.pri{background:var(--acc);color:var(--card);border-color:var(--acc);font-weight:600}
+table{border-collapse:collapse;width:100%;font-size:.9rem}th,td{border-bottom:1px solid var(--line);padding:5px 6px;text-align:left}td.n{text-align:right}
+.ng{color:var(--ng);font-weight:600}.warn{color:var(--warn)}
+.sum span{display:inline-block;margin-right:16px}
+</style>
+</head>
+<body>
+<main>
+<h1>領収書の出し忘れチェック</h1>
+<p class="note">カード・通帳の明細と、手元の領収書の一覧を貼り付けると、「明細はあるのに領収書がない」「領収書はあるのに明細にない」ものと、月ごとの件数が出ます。</p>
+<div class="card note"><b>架空のサンプルが入っています。</b>消して、ご自身のデータを貼ってください。入力は、この画面の中だけで処理され、保存も外部への送信もしません（再読み込みで消えます）。経費にできるかどうかなど税務の判断はしません。照合は「金額が同じで、日付が近い」ものを同じ取引と見なす目安で、最終確認は目視でお願いします。</div>
+
+<div class="cols">
+  <div><h2>① 明細（カード・通帳）</h2>
+  <textarea id="st" aria-label="明細"></textarea></div>
+  <div><h2>② 手元の領収書</h2>
+  <textarea id="rc" aria-label="領収書"></textarea></div>
+</div>
+<p class="note">1行1件。「日付・店名やメモ・金額」の順で、Excelからのコピー（タブ区切り）でも読めます。カンマ区切りは、金額を引用符で囲む（"1,980"）かカンマなしにすると確実です（引用符なしの 1,980 は桁区切りとみなし、画面に注記を出します）。カード会社の明細CSV（見出し行あり・列が多い・引用符つき）は、日付・金額・店名の列を自動で推定します（読み取った列は結果の上に表示）。見出しが無く金額らしい列が複数ある時は、残高などと区別できないため読まずにエラーにします。日付は 2026-09-05／2026/9/5／2026年9月5日／10/03（年は他の行から補う）／令和8年10月3日 の形。金額は円の整数（¥・円・3桁カンマ・全角数字も可）。読めない行は赤く表示し、照合には使いません。</p>
+<p>日付のずれを <input type="number" id="tol" min="0" max="31" value="3"> 日まで同じ取引と見なす
+<button class="pri" id="go">照合する</button>
+<button id="clr">サンプルを消す</button>
+<button id="csv">結果をCSVでダウンロード</button></p>
+
+<div class="card sum" id="sum"></div>
+<h2>明細にあるが、領収書がない（出し忘れの候補）</h2><div id="tA"></div>
+<h2>領収書があるが、明細に見当たらない（現金払い・別の口座など）</h2><div id="tB"></div>
+<h2>月ごとの件数（明細ベース）</h2><div id="tM"></div>
+<h2>読み取れなかった行</h2><div id="tE"></div>
+</main>
+<script>
+/* ---- CALC-START（照合ロジック。DOMに触れない） */
+function norm(s){return String(s).normalize('NFKC');}
+function parseDate(s){
+  var m=s.match(/(\d{4})[-\/.年](\d{1,2})[-\/.月](\d{1,2})日?/);if(!m)return null;
+  var y=+m[1],mo=+m[2],d=+m[3],t=Date.UTC(y,mo-1,d),x=new Date(t);
+  if(x.getUTCFullYear()!==y||x.getUTCMonth()!==mo-1||x.getUTCDate()!==d)return null;
+  return {iso:y+'-'+('0'+mo).slice(-2)+'-'+('0'+d).slice(-2),day:Math.round(t/864e5),rest:s.replace(m[0],' ')};
+}
+function parseLine(line){
+  var s=norm(line).trim();if(!s)return null;
+  var dt=parseDate(s);if(!dt)return {err:'日付が読めません'};
+  var rest=dt.rest,am=rest.match(/[¥\\]?\s*(-?\d[\d,]*(?:\.\d+)?)\s*円?\s*$/);
+  if(!am)return {err:'金額が読めません'};
+  var ca=chkAmt(am[1]);if(ca.err)return ca;var raw=String(ca.amount);
+  var memo=rest.slice(0,am.index).replace(/[\t,，、]+/g,' ').replace(/\s+/g,' ').trim();
+  return {iso:dt.iso,day:dt.day,amount:ca.amount,memo:memo};
+}
+function chkAmt(raw){
+  raw=raw.replace(/,/g,'');
+  if(!/^\d+$/.test(raw)||+raw<1||+raw>1e9)return {err:'金額は1円以上10億円以下の整数にしてください'};
+  return {amount:+raw};
+}
+/* 明細CSV対応：セル単位の日付（令和・年なし・時刻付きも可）と、列の自動推定 */
+function parseDateCell(s,year){
+  s=norm(s).trim().replace(/\s*\d{1,2}:\d{2}(:\d{2})?\s*$/,'').replace(/[（(][月火水木金土日][）)]$/,'').trim();
+  var m,y,mo,d;
+  if(m=s.match(/^(\d{4})[-\/.年](\d{1,2})[-\/.月](\d{1,2})日?$/)){y=+m[1];mo=+m[2];d=+m[3];}
+  else if(m=s.match(/^(令和|平成|[RrHh])\s*(\d{1,2}|元)[年.\/-](\d{1,2})[月.\/-](\d{1,2})日?$/)){
+    y=(/令|[Rr]/.test(m[1])?2018:1988)+(m[2]==='元'?1:+m[2]);mo=+m[3];d=+m[4];}
+  else if(m=s.match(/^(\d{1,2})[\/月-](\d{1,2})日?$/)){y=year;mo=+m[1];d=+m[2];if(!y)return null;m.noYear=1;}
+  else return null;
+  var t=Date.UTC(y,mo-1,d),x=new Date(t);
+  if(x.getUTCFullYear()!==y||x.getUTCMonth()!==mo-1||x.getUTCDate()!==d)return null;
+  return {iso:y+'-'+('0'+mo).slice(-2)+'-'+('0'+d).slice(-2),day:Math.round(t/864e5),y:y,noYear:!!m.noYear};
+}
+function splitCells(line,d){
+  var out=[],cur='',q=false;
+  for(var i=0;i<line.length;i++){var c=line[i];
+    if(q){if(c==='"'){if(line[i+1]==='"'){cur+='"';i++;}else q=false;}else cur+=c;}
+    else if(c==='"'&&cur.trim()===''){q=true;cur='';}
+    else if(c===d){out.push(cur);cur='';}
+    else cur+=c;}
+  out.push(cur);return out.map(function(x){return x.trim();});
+}
+var AMT_RE=/^[¥\\]?\s*-?\d[\d,]*(?:\.\d+)?\s*円?$/;
+function isAmt(c){return AMT_RE.test(c);}
+/* 引用符なしの「1,980」は列区切りと区別できない。全行が同じ列数にそろう時だけ桁区切りとして結合する（曖昧なので画面に注記） */
+function mergeG(c){var o=[],i,j,s;
+  for(i=0;i<c.length;i++){
+    if(/^\d{1,3}$/.test(c[i])){j=i+1;s=c[i];while(j<c.length&&/^\d{3}$/.test(c[j])){s+=','+c[j];j++;}
+      if(j>i+1){o.push(s);i=j-1;continue;}}
+    o.push(c[i]);}
+  return o;}
+function detectTable(lines){
+  var tabs=lines.filter(function(l){return l.s.indexOf('\t')>=0;}).length,d=tabs*2>=lines.length&&tabs>0?'\t':',',min=d==='\t'?2:3;
+  var rows=lines.map(function(l){return {l:l,c:splitCells(l.s,d),mg:false};}),cnt={},merged=false;
+  if(d===','){var mg=rows.map(function(r){return mergeG(r.c);});
+    if(mg.some(function(m,i){return m.length!==rows[i].c.length;})&&mg.every(function(m){return m.length===mg[0].length;})){rows.forEach(function(r,i){r.mg=mg[i].length!==r.c.length;r.c=mg[i];});merged=true;}}
+  rows.forEach(function(r){cnt[r.c.length]=(cnt[r.c.length]||0)+1;});
+  var best=0,bn=0;Object.keys(cnt).forEach(function(k){if(cnt[k]>bn){bn=cnt[k];best=+k;}});
+  var nd=rows.filter(function(r){return r.c.some(function(x){return parseDateCell(x,2000);});}).length;
+  if(!(best>=min&&bn*2>=rows.length&&nd*2>=rows.length))return null; // 日付のセルが半数に満たなければ表と見なさず1行ずつ読む
+  rows.merged=merged;return rows;
+}
+function parseTable(rows,year0){
+  var ok=[],err=[],header=null,info='';
+  var hasDate=function(r){return r.c.some(function(x){return parseDateCell(x,2000);});};
+  var merged=rows.merged,hn=0,mc0={},mb=0,mk=0;
+  rows.slice(1).forEach(function(r){mc0[r.c.length]=(mc0[r.c.length]||0)+1;});
+  Object.keys(mc0).forEach(function(k){if(mc0[k]>mb){mb=mc0[k];mk=+k;}});
+  // 見出し行として外すのは、数字を1文字も含まず、列数が他の行と同じ行だけ（前置き行などは外さずエラーに出す）
+  if(rows.length>1&&!/\d/.test(rows[0].l.s)&&rows[0].c.length===mk){hn=rows[0].l.n;header=rows.shift().c;}
+  var data=rows.filter(function(r){return r.c.length>=2;}),nc=0;
+  data.forEach(function(r){nc=Math.max(nc,r.c.length);});
+  var frac=function(c,f){var n=0;data.forEach(function(r){if(r.c[c]!==undefined&&f(r.c[c]))n++;});return n/(data.length||1);};
+  var isDt=function(x){return !!parseDateCell(x,2000);};
+  var hd=function(c){return header&&header[c]!==undefined?header[c]:'';};
+  var dc=-1,ac=-1,mc=-1,i,bestS;
+  // 日付：日付らしさ最大。同率なら年つきの列（「1/1」より「2026/10/3」）→見出しに日付系の語がある列。なお決まらなければ曖昧としてエラーに倒す
+  var dcs=[],amb='';
+  for(i=0;i<nc;i++){var f=frac(i,isDt);if(f>0)dcs.push({i:i,f:f,y:frac(i,function(x){var q=parseDateCell(x,undefined);return q&&!q.noYear;}),h:/日付|利用日|取引日|年月日/.test(hd(i))?1:0});}
+  dcs.sort(function(a,b){return b.f-a.f||b.y-a.y||b.h-a.h||a.i-b.i;});
+  if(dcs.length){dc=dcs[0].i;var d1=dcs[1];if(d1&&d1.f===dcs[0].f&&d1.y===dcs[0].y&&!dcs[0].h)amb='日付の列を決められません（'+(dcs[0].i+1)+'列目と'+(d1.i+1)+'列目が日付らしく見えます）。見出し行に「日付」を入れるか、日付・メモ・金額の3列に整えて貼り直してください';}
+  // 金額：数値らしさ最大。見出しに金額系の語がある列があればその列（複数なら値の種類が多い列→左の列）。見出しの手掛かりが無く金額らしい列が複数あれば曖昧としてエラー（残高・回数と区別できないため）。残高・回数・番号は除く
+  var cands=[];
+  for(i=0;i<nc;i++){if(i===dc||/残高|回数|番号|ID|ポイント/i.test(hd(i)))continue;var fa=frac(i,isAmt);if(fa>0)cands.push({i:i,f:fa,h:/金額|利用額|支払額|出金|入金|額/.test(hd(i))?1:0,u:new Set(data.map(function(r){return r.c[i];})).size});}
+  var strong=cands.filter(function(x){return x.f>=.5;}),sh=strong.filter(function(x){return x.h;});
+  if(sh.length)cands=sh;
+  else if(strong.length>=2&&!amb)amb='金額の列を決められません（'+strong.map(function(x){return (x.i+1)+'列目';}).join('・')+'が金額らしく見えます。残高や回数と区別できません）。見出し行に「金額」を入れるか、日付・メモ・金額の3列に整えて貼り直してください';
+  cands.sort(function(a,b){return b.f-a.f||b.h-a.h||b.u-a.u||a.i-b.i;});
+  if(cands.length)ac=cands[0].i;
+  var isTxt=function(x){return x!==''&&!isAmt(x)&&!isDt(x);},ms=[];
+  for(i=0;i<nc;i++){if(i===dc||i===ac)continue;var tf=frac(i,isTxt);if(tf>0){var tl=0,tn=0;data.forEach(function(r){if(r.c[i]&&isTxt(r.c[i])){tl+=r.c[i].length;tn++;}});ms.push({i:i,h:/店|先|摘要|内容|メモ|品名/.test(hd(i))?1:0,len:tl/tn});}}
+  ms.sort(function(a,b){return b.h-a.h||b.len-a.len||a.i-b.i;});
+  if(ms.length)mc=ms[0].i;
+  // 見出しなしで全行が「結合が必要」な形（回数＋3桁以下の金額 と 桁区切り の区別がつかない）は金額を決めない。1行でも結合不要の行があれば桁区切りと読める
+  if(merged&&!header&&rows.length>=3&&rows.every(function(r){return r.mg;})&&!amb)amb='桁区切りか回数か決められません。見出し行（日付,店名,金額）を付けてください';
+  if(dc<0||ac<0||amb){
+    rows.forEach(function(r){err.push({n:r.l.n,text:r.l.raw,err:amb||'列を推定できません（日付または金額の列が見つかりません）'});});
+    return {ok:ok,err:err,info:''};
+  }
+  var yc={};data.forEach(function(r){var p=parseDateCell(r.c[dc],2000),q=r.c[dc]!==undefined&&parseDateCell(r.c[dc],undefined);if(q&&!q.noYear)yc[q.y]=(yc[q.y]||0)+1;});
+  // 年なし日付：同じ列の年つき日付があればその年（最多）で補う。月が大きく巻き戻る（年をまたぐ）並びなら年を決められないのでエラー
+  var mos=[],wrap=false,anyNY=false,yearKnown=Object.keys(yc).length>0;
+  data.forEach(function(r){var q=parseDateCell(r.c[dc],2000);if(q){mos.push(+q.iso.slice(5,7));if(q.noYear)anyNY=true;}});
+  for(i=1;i<mos.length;i++)if(Math.abs(mos[i]-mos[i-1])>6)wrap=true;
+  var year=year0,yb=0;Object.keys(yc).forEach(function(k){if(yc[k]>yb){yb=yc[k];year=+k;}});
+  rows.forEach(function(r){
+    if(r.c.length<2){var o=parseLine(r.l.raw);if(!o)return;if(o.err)err.push({n:r.l.n,text:r.l.raw,err:o.err});else{o.n=r.l.n;ok.push(o);}return;}
+    var bad=function(m){err.push({n:r.l.n,text:r.l.raw,err:m});};
+    if(r.c.length<=Math.max(dc,ac))return bad('列が足りません');
+    var dt=parseDateCell(r.c[dc],wrap?undefined:year);if(!dt)return bad(wrap&&parseDateCell(r.c[dc],2000)?'年をまたぐため年を決められません（日付に年を入れて貼り直してください）':'日付が読めません');
+    var cell=r.c[ac].replace(/^[¥\\]\s*/,'').replace(/\s*円$/,'');
+    if(!/^-?\d[\d,]*(\.\d+)?$/.test(cell))return bad('金額が読めません');
+    var a=chkAmt(cell);if(a.err)return bad(a.err);
+    ok.push({iso:dt.iso,day:dt.day,amount:a.amount,memo:mc>=0&&r.c[mc]?r.c[mc].replace(/\s+/g,' '):'',n:r.l.n});
+  });
+  var nm=function(c){return (c+1)+'列目'+(hd(c)?'「'+hd(c)+'」':'');};
+  info='読み取った列：日付＝'+nm(dc)+'、金額＝'+nm(ac)+'、メモ＝'+(mc>=0?nm(mc):'なし')+(header?'。'+hn+'行目「'+header.join(' / ')+'」は見出し行として読み飛ばし':'')+(merged?'。【注意】引用符のない「1,980」のような数字は桁区切りの金額として読みました（列区切りか桁区切りか区別できないため。違う場合は引用符で囲むか、カンマなしで貼り直してください）':'')+(anyNY&&!yearKnown&&!wrap?'。【注意】日付に年が無いので'+year+'年として読みました（違う場合は年つきの日付で貼り直してください）':'')+'。違っていたら、日付・メモ・金額の3列だけに整えて貼り直してください。';
+  return {ok:ok,err:err,info:info};
+}
+function parseAll(text,year){
+  var lines=[];
+  String(text).split(/\r?\n/).forEach(function(l,i){var s=norm(l);if(s.trim())lines.push({n:i+1,raw:l,s:s});});
+  var rows=lines.length?detectTable(lines):null;
+  if(rows)return parseTable(rows,year||new Date().getFullYear());
+  var ok=[],err=[];
+  String(text).split(/\r?\n/).forEach(function(l,i){
+    var r=parseLine(l);if(!r)return;
+    if(r.err)err.push({n:i+1,text:l,err:r.err});else{r.n=i+1;ok.push(r);}
+  });
+  return {ok:ok,err:err,info:''};
+}
+function match(st,rc,tol){
+  var pairs=[];
+  st.forEach(function(a,i){rc.forEach(function(b,j){
+    if(a.amount===b.amount){var d=Math.abs(a.day-b.day);if(d<=tol)pairs.push([d,i,j]);}
+  });});
+  pairs.sort(function(x,y){return x[0]-y[0]||x[1]-y[1]||x[2]-y[2];});
+  var us={},ur={},m=[];
+  pairs.forEach(function(p){if(us[p[1]]||ur[p[2]])return;us[p[1]]=ur[p[2]]=1;m.push([p[1],p[2]]);});
+  return {matched:m,stOnly:st.filter(function(_,i){return !us[i];}),rcOnly:rc.filter(function(_,j){return !ur[j];})};
+}
+function byMonth(st,res){
+  var o={},miss=new Set(res.stOnly);
+  st.forEach(function(r){var k=r.iso.slice(0,7);o[k]=o[k]||{n:0,miss:0,sum:0};o[k].n++;o[k].sum+=r.amount;if(miss.has(r))o[k].miss++;});
+  return Object.keys(o).sort().map(function(k){return {month:k,n:o[k].n,miss:o[k].miss,sum:o[k].sum};});
+}
+/* ---- CALC-END */
+var $=function(i){return document.getElementById(i);};
+var SAMPLE_ST="2026-09-02\tサンプル文具店\t1,980\n2026-09-05\tダミー運送\t3,300\n2026-09-08\t架空ガソリン\t6,420\n2026-09-12\t見本資材店\t12,800\n2026-09-15\tサンプル書店\t2,750\n2026-09-20\t架空カフェ\t1,540\n2026-10-01\tダミー文具\t880";
+var SAMPLE_RC="2026/9/2\t文具店\t1980\n2026/9/6\t運送 伝票\t3300\n2026/9/12\t資材店\t12800\n2026/9/15\t書店\t2750\n2026/9/25\t現金払い 駐車場\t600";
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function yen(n){return n.toLocaleString('ja-JP')+'円';}
+function table(h,rows,numCol){
+  if(!rows.length)return '<p class="note">該当なし</p>';
+  return '<table><tr>'+h.map(function(x){return '<th>'+x+'</th>';}).join('')+'</tr>'+rows.map(function(r){
+    return '<tr>'+r.map(function(c,i){return '<td'+(i===numCol?' class="n"':'')+'>'+esc(c)+'</td>';}).join('')+'</tr>';}).join('')+'</table>';
+}
+var last=null;
+function run(){
+  var a=parseAll($('st').value),b=parseAll($('rc').value),tol=Math.max(0,Math.min(31,parseInt($('tol').value,10)||0));
+  var r=match(a.ok,b.ok,tol);last={a:a,b:b,r:r};
+  $('sum').innerHTML='<span>明細 <b>'+a.ok.length+'</b>件</span><span>領収書 <b>'+b.ok.length+'</b>件</span><span>照合できた <b>'+r.matched.length+'</b>件</span><span class="ng">領収書なし <b>'+r.stOnly.length+'</b>件（'+yen(r.stOnly.reduce(function(s,x){return s+x.amount;},0))+'）</span><span class="warn">明細なし <b>'+r.rcOnly.length+'</b>件</span>'+(a.info?'<br><span class="note">明細：'+esc(a.info)+'</span>':'')+(b.info?'<br><span class="note">領収書：'+esc(b.info)+'</span>':'');
+  var row=function(x){return [x.iso,x.memo,x.amount.toLocaleString('ja-JP'),'行'+x.n];};
+  $('tA').innerHTML=table(['日付','メモ','金額','行'],r.stOnly.map(row),2);
+  $('tB').innerHTML=table(['日付','メモ','金額','行'],r.rcOnly.map(row),2);
+  $('tM').innerHTML=table(['月','明細の件数','うち領収書なし','明細の合計'],byMonth(a.ok,r).map(function(m){return [m.month,m.n,m.miss,yen(m.sum)];}),3);
+  var errs=a.err.map(function(e){return ['明細',e.n,e.text,e.err];}).concat(b.err.map(function(e){return ['領収書',e.n,e.text,e.err];}));
+  $('tE').innerHTML=errs.length?table(['欄','行','内容','理由'],errs):'<p class="note">なし</p>';
+}
+$('go').onclick=run;
+$('clr').onclick=function(){$('st').value='';$('rc').value='';run();};
+$('csv').onclick=function(){
+  if(!last)run();
+  var q=function(s){return '"'+String(s).replace(/"/g,'""')+'"';};
+  var rows=[['区分','日付','メモ','金額']].concat(last.r.stOnly.map(function(x){return ['領収書なし',x.iso,x.memo,x.amount];}),last.r.rcOnly.map(function(x){return ['明細なし',x.iso,x.memo,x.amount];}));
+  var a=document.createElement('a');a.href=URL.createObjectURL(new Blob(['﻿'+rows.map(function(r){return r.map(q).join(',');}).join('\r\n')],{type:'text/csv'}));
+  a.download='receipt-check.csv';a.click();
+};
+$('st').value=SAMPLE_ST;$('rc').value=SAMPLE_RC;run();
+</script>
+</body>
+</html>
